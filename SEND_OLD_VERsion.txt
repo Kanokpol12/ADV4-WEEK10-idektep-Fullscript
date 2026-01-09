@@ -1,0 +1,333 @@
+import time, cv2, serial, logging
+import numpy as np
+from logging import info, error
+from coloredlogs import install 
+
+# ... (ส่วน LOGGING SETUP, CONFIGURABLE OFFSETS, init_serial, send_state, receive_state เหมือนเดิม) ...
+# ... (object_position_check, object_position_cal, color_detection_choose, process_setup เหมือนเดิม) ...
+# ... (find_and_pick_one เหมือนเดิม) ...
+
+# ======== LOGGING SETUP =========
+log_format = "%(asctime)s - %(hostname)s:%(username)s:%(programname)s - %(levelname)s: %(message)s"
+install(level="info", format=log_format)
+logging.basicConfig(level=logging.INFO)
+
+# ======== CONFIGURABLE OFFSETS =========
+y_fix = 30
+X_OFFSET = 0   # (mm) Offset X ของกล้องเทียบกับ Gripper
+Y_OFFSET = 128-y_fix   # (mm) Offset Y ของกล้องเทียบกับ Gripper
+# =======================================
+
+def init_serial():
+    """
+    เริ่มต้นการเชื่อมต่อ Serial Port
+    """
+    # *** ตรวจสอบว่า COM Port ถูกต้องหรือไม่ (เช่น "COM12") ***
+    return serial.Serial(port="COM3", baudrate=115200, timeout=1)   
+
+def send_state(serial_port, data):
+    """
+    ส่งข้อมูลไปยัง Arduino พร้อมกับ newline character (\n)
+    """
+    try:
+        command_to_send = f"{data}\n"
+        serial_port.write(command_to_send.encode('utf-8'))
+        info(f"Sent: {data}")
+    except serial.SerialException as e:
+        error(f"Error Sending data: {e}")
+
+def receive_state(serial_port):
+    """
+    (ใช้สำหรับ Setup) รอรับข้อความยืนยันจาก Arduino (Blocking)
+    """
+    state_message = ["Sethome position", "Ready to detect"]
+    try:
+        while True:
+            serial_port.timeout = 5 
+            line = serial_port.readline().decode('utf-8').rstrip()
+            serial_port.timeout = 1 
+            
+            if line:
+                info(f"Receive: {line}")
+                if line in state_message:
+                    break
+            else:
+                info("Waiting for setup message... (Check Arduino connection)")
+                
+    except serial.SerialException as e:
+        error(f"Serial communication error: {e}")
+    except KeyboardInterrupt:
+        error("Stopped by user.")
+
+def object_position_check(data_stream, stamp_choose, target_count=20):
+    """
+    ตรวจสอบว่าพิกัดของ Object นิ่งหรือไม่ โดยเช็คค่าซ้ำกัน target_count ครั้ง
+    """
+    count, last_value = 0, None
+    for data in data_stream:
+        if data == last_value:
+            count += 1
+        else:
+            count = 1
+            last_value = data
+        if count == target_count:
+            adjusted_x = data[0] + X_OFFSET
+            adjusted_y = data[1] + Y_OFFSET
+            return f"G{stamp_choose} X{adjusted_x:.1f} Y{adjusted_y:.1f}"
+    return None 
+
+def object_position_cal(frame, cx, cy, mm_per_pixel = 0.53):
+    """
+    คำนวณพิกัด Offset (mm) จากจุดศูนย์กลางกล้อง
+    """
+    h, w, c_channel = frame.shape
+    cam_center = (int(w / 2), int(h / 2))
+    offset_x = cx - cam_center[0]
+    offset_y = cy - cam_center[1]
+    cv2.circle(frame, (cx, cy), 5, (0, 255, 0), -1)
+    cv2.line(frame, cam_center, (cx, cy), (255, 255, 255), 2)
+    return int(offset_x * mm_per_pixel), int(offset_y * mm_per_pixel)
+
+def color_detection_choose(c_choose, frame):
+    """
+    สร้าง Mask ของสีที่เลือก
+    """
+    frame_hsv = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
+    if c_choose == "red":
+        lower_red1 = np.array([0, 100, 100])
+        upper_red1 = np.array([10, 255, 255])
+        lower_red2 = np.array([160, 100, 100])
+        upper_red2 = np.array([179, 255, 255])
+        mask1 = cv2.inRange(frame_hsv, lower_red1, upper_red1)
+        mask2 = cv2.inRange(frame_hsv, lower_red2, upper_red2)
+        mask = mask1 + mask2
+        return mask
+    elif c_choose == "blue":
+        lower_lightblue = np.array([85, 100, 100])
+        upper_lightblue = np.array([115, 255, 255])
+        mask_lightblue = cv2.inRange(frame_hsv, lower_lightblue, upper_lightblue)
+        return mask_lightblue
+    elif c_choose == "green":
+        lower_green = np.array([62.55, 39.76, 104.2])
+        upper_green = np.array([97.2, 255, 255])
+        mask_green = cv2.inRange(frame_hsv, lower_green, upper_green)
+        return mask_green
+    elif c_choose == "orange":
+        lower_orange = np.array([10, 100, 100])
+        upper_orange = np.array([25, 255, 255])
+        mask_orange = cv2.inRange(frame_hsv, lower_orange, upper_orange)
+        return mask_orange
+    elif c_choose == "yellow":
+        lower_yellow = np.array([25, 100, 100])
+        upper_yellow = np.array([35, 255, 255])
+        mask_yellow = cv2.inRange(frame_hsv, lower_yellow, upper_yellow)
+        return mask_yellow
+    elif c_choose == "b":
+        lower_lightblue2 = np.array([94.31, 45.24, 134.35])
+        upper_lightblue2 = np.array([158.8, 255, 255])
+        mask_lightblue2 = cv2.inRange(frame_hsv, lower_lightblue2, upper_lightblue2)
+        return mask_lightblue2
+    else:
+        return None
+
+def process_setup():
+    """
+    ฟังก์ชันสำหรับ Setup หุ่นยนต์ (Homing และ Ready)
+    """
+    try:
+        ser = init_serial()
+        if ser.is_open:
+            info("SERIAL PORT IS OPEN AND CONFIGURED.")
+            time.sleep(2)
+            send_state(serial_port=ser, data="home")
+            receive_state(serial_port=ser) 
+            time.sleep(2)
+            send_state(serial_port=ser, data="ready")
+            receive_state(serial_port=ser)
+            time.sleep(2)
+            info("SETUP PROCESS COMPLETELY.")
+            return ser
+    except serial.SerialException as e:
+        error(f"Serial communication error: {e}")
+        return None
+
+def find_and_pick_one(serial_port, cap, c_choose):
+    """
+    (ปรับปรุง) เพิ่มการ Masking (ROI) เพื่อค้นหาเฉพาะใน "โซนหยิบ"
+    """
+    info(f"STARTING DETECTION CYCLE FOR: {c_choose}")
+    data_list = []
+    waiting_for_robot_to_finish = False
+    no_object_timer = 0
+    NO_OBJECT_TIMEOUT_FRAMES = 20 
+    PICK_ZONE_Y_START_RATIO = 0.4821
+    try:
+        while True: 
+            ret ,frame = cap.read()
+            if not ret:
+                error("Failed to read from camera.")
+                return 'error'
+            
+            frame_h, frame_w, _ = frame.shape
+            pick_zone_y_pixel = int(frame_h * PICK_ZONE_Y_START_RATIO)
+            cv2.line(frame, (0, pick_zone_y_pixel), (frame_w, pick_zone_y_pixel), (0, 255, 255), 2)
+            cv2.putText(frame, "PICK ZONE (Searching below this line)", (10, pick_zone_y_pixel - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 255), 2)
+            
+            if not waiting_for_robot_to_finish:
+                mask_c = color_detection_choose(c_choose=c_choose, frame=frame)
+                if mask_c is None:
+                    error(f"Color '{c_choose}' not configured.")
+                    return 'error'
+                mask_c[0:pick_zone_y_pixel, :] = 0
+                contours, _ = cv2.findContours(mask_c, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+                if contours:
+                    no_object_timer = 0 
+                    c_target = max(contours, key=cv2.contourArea)
+                    M_target = cv2.moments(c_target)
+                    if M_target["m00"] > 0:
+                        cx_target = int(M_target["m10"] / M_target["m00"])
+                        cy_target = int(M_target["m01"] / M_target["m00"])
+                        data = object_position_cal(frame=frame, cx=cx_target, cy=cy_target)
+                        data_list.append(data)
+                        offset_x_mm, offset_y_mm = data
+                        cv2.putText(frame, f"Offset: ({offset_x_mm:.1f}, {offset_y_mm:.1f}) mm",
+                                    (10, 60), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 255), 2)
+                        object_result = object_position_check(data_stream=data_list, stamp_choose=1) # G1
+                        if object_result:
+                            info(f"OBJECT FOUND. SENT COORDINATE '{object_result}' TO CARTESIAN.")
+                            time.sleep(0.5) 
+                            send_state(serial_port=serial_port, data=str(object_result))
+                            waiting_for_robot_to_finish = True
+                            data_list = [] 
+                else:
+                    no_object_timer += 1
+                    if no_object_timer > NO_OBJECT_TIMEOUT_FRAMES:
+                        info(f"No object found for '{c_choose}' after timeout.")
+                        return 'no_object_found' # ไม่เจอวัตถุ
+            
+            if waiting_for_robot_to_finish:
+                cv2.putText(frame, "WAITING FOR ROBOT...", (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 0, 255), 2)
+                try:
+                    if serial_port.in_waiting > 0:
+                        line = serial_port.readline().decode('utf-8').rstrip()
+                        if line:
+                            info(f"Receive: {line}") 
+                            if line == "Sucess to pick and place objects":
+                                info("Task complete! Ready for next object.")
+                                return 'object_picked' 
+                except serial.SerialException as e:
+                    error(f"Serial error while waiting: {e}")
+                    return 'error'
+            cv2.imshow("Multi-Color Detection", frame)
+            key = cv2.waitKey(1)
+            if key == ord('q'):
+                info("Closed Camera by user")
+                return 'quit'
+    except Exception as e:
+        error(f"Critical error in detection cycle: {e}")
+        return 'error'
+
+# <<< --- (สำคัญ) ฟังก์ชัน main() ถูกแก้ไข --- >>>
+def main(): 
+    ser = None
+    cap = None
+    try:
+        ser = process_setup()
+        if not ser:
+            error("CANNOT START, serial port not initialized.")
+            return
+        cap = cv2.VideoCapture(1) # *** ตรวจสอบเลข Camera Index (อาจจะเป็น 0 หรือ 1) ***
+        if not cap.isOpened():
+            error("CANNOT START, camera not found or cannot be opened.")
+            return
+            
+        info("SYSTEM READY. Starting main loop.")
+        
+        # --- (NEW) สร้างหน้าต่าง CV ไว้นอก Loop ---
+        cv2.namedWindow("Multi-Color Detection")
+
+        while True:
+            
+            # --- (NEW) Loop แสดงข้อความ "รอ Input" ---
+            # Loop นี้จะคอยอัปเดตหน้าต่างกล้อง *ก่อน* ที่จะเรียก input()
+            info("Waiting for user input in CONSOLE...")
+            while True:
+                ret, frame = cap.read()
+                if not ret:
+                    error("Camera feed lost.")
+                    return # ออกจากโปรแกรมถ้ากล้องดับ
+
+                frame_h, frame_w, _ = frame.shape
+                # วาดข้อความลงบน frame
+                cv2.putText(frame, "Check CONSOLE window to type next color", 
+                            (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 255), 2)
+                cv2.putText(frame, "(This window will freeze while you type)", 
+                            (10, 60), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 255), 2)
+                
+                cv2.imshow("Multi-Color Detection", frame)
+                
+                # เราเรียก waitKey(50) เพื่อให้หน้าต่างอัปเดต
+                # และเช็คว่ามีการกด 'q' หรือไม่
+                key_check = cv2.waitKey(50)
+                if key_check == ord('q'):
+                     info("Exiting program by user request ('q').")
+                     return # ออกจาก main()
+
+                # *** เราจะ break จาก loop นี้หลังจากอัปเดตหน้าจอ 1-2 ครั้ง
+                # *** เพื่อไปเรียก input() ที่ Console
+                # *** เราสามารถเพิ่มการหน่วงเวลาตรงนี้ได้ ถ้าต้องการให้ข้อความค้างนานขึ้น
+                time.sleep(0.05) # หน่วงเวลาเล็กน้อย
+                break # ออกจาก loop นี้เพื่อไปเรียก input()
+            
+            # --- (Original Code) เรียก input() ---
+            # ณ จุดนี้ หน้าต่าง CV จะ "ค้าง" ชั่วคราว (ตามข้อความที่เราเตือนไว้)
+            c_choose = input("\n[INPUT] CHOOSE COLOR (blue, green, orange, red, yellow, b) \n(Type 'q' or 'exit' to quit): ").strip().lower()
+
+            if c_choose in ['q', 'exit']:
+                info("Exiting program by user request.")
+                break # ออกจาก Loop หลัก
+            
+            if c_choose not in ["blue", "green", "orange", "red", "yellow", "b"]:
+                error(f"Invalid color '{c_choose}'. Please try again.")
+                continue # กลับไปที่ Loop "รอ Input"
+
+            # --- (Original Code) เริ่ม Loop การหยิบ ---
+            info(f"--- STARTING JOB: CLEARING ALL '{c_choose}' OBJECTS ---")
+            while True:
+                # find_and_pick_one จะควบคุมการแสดงผล CV ระหว่างทำงาน
+                status = find_and_pick_one(ser, cap, c_choose)
+                
+                if status == 'no_object_found':
+                    info(f"--- JOB COMPLETE: All '{c_choose}' objects cleared. ---")
+                    time.sleep(1.0) # หน่วงเวลา 1 วิ ให้เห็นเฟรมสุดท้าย
+                    break # ออกจาก Loop ย่อย (กลับไปที่ Loop "รอ Input")
+                
+                elif status == 'object_picked':
+                    info("One object cleared. Looking for the next one...")
+                    time.sleep(1) 
+                    continue # ทำงาน Loop ย่อยต่อ
+                
+                elif status == 'quit':
+                     info("Stopping main loop due to user quit ('q' during picking).")
+                     return # ออกจาก main()
+                
+                elif status == 'error':
+                    error("Stopping main loop due to error.")
+                    return # ออกจาก main()
+                        
+    except Exception as e:
+        error(f"Main function error : {e}")
+    except KeyboardInterrupt:
+        info("Program stopped by user (Ctrl+C).")
+    finally:
+        # --- ปิดระบบ ---
+        if cap:
+            cap.release()
+            info("Camera released.")
+        cv2.destroyAllWindows()
+        if ser and ser.is_open:
+            ser.close()
+            info("Serial port closed.")
+
+if __name__ == '__main__':
+    main()
